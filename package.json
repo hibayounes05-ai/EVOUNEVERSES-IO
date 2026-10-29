@@ -1,0 +1,14 @@
+{
+  "name": "evouneverses-io-server",
+  "version": "2.4.0",
+  "private": true,
+  "description": "Purple planetary player rendering and local player collision prototype",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}
