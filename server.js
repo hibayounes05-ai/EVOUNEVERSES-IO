@@ -13,7 +13,7 @@ const io = new Server(server, {
   maxHttpBufferSize: 16 * 1024,
   perMessageDeflate: false
 });
-const ROOT = path.join(__dirname, '..');
+const ROOT = __dirname;
 const players = new Map();
 const playerSystems = new Map();
 const worldSystems = new Map();
