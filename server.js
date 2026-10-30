@@ -13,10 +13,11 @@ const io = new Server(server, {
   maxHttpBufferSize: 16 * 1024,
   perMessageDeflate: false
 });
-const ROOT = __dirname;
+const ROOT = path.join(__dirname, '..');
 const players = new Map();
 const playerSystems = new Map();
 const worldSystems = new Map();
+const collisionCooldowns = new Map();
 let nextSystemId = 1;
 app.disable('x-powered-by');
 app.get('/health', (_req, res) => res.json({ ok: true, game: 'EVOUNEVERSES IO', players: players.size, systems: worldSystems.size, mode: 'multiplayer-prototype' }));
@@ -27,6 +28,40 @@ function publicPlayers() { return [...players.entries()].map(([id, p]) => ({ id,
 function publicSystems() { return [...worldSystems.values()]; }
 function broadcastPlayers() { io.emit('players', publicPlayers()); }
 function broadcastSystems() { io.emit('world:systems', publicSystems()); }
+function resolvePlayerCollisions() {
+  const entries = [...players.entries()];
+  const now = Date.now();
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const [idA, a] = entries[i], [idB, b] = entries[j];
+      let dx = a.x - b.x, dy = a.y - b.y;
+      let distance = Math.hypot(dx, dy);
+      const minDistance = a.r + b.r + 2;
+      if (distance >= minDistance) continue;
+      if (distance < 0.001) {
+        const seed = [...(idA + idB)].reduce((n, ch) => (n * 31 + ch.charCodeAt(0)) >>> 0, 7);
+        const angle = (seed % 360) * Math.PI / 180;
+        dx = Math.cos(angle); dy = Math.sin(angle); distance = 1;
+      }
+      const nx = dx / distance, ny = dy / distance;
+      const push = (minDistance - distance) / 2 + 1;
+      a.x = finiteBound(a.x + nx * push, 145000);
+      a.y = finiteBound(a.y + ny * push, 145000);
+      b.x = finiteBound(b.x - nx * push, 145000);
+      b.y = finiteBound(b.y - ny * push, 145000);
+      const key = [idA, idB].sort().join(':');
+      const lastHit = collisionCooldowns.get(key) || 0;
+      const hit = now - lastHit >= 650;
+      if (hit) {
+        collisionCooldowns.set(key, now);
+        a.hp = Math.max(0, a.hp - (a.isStar ? 2 : 5));
+        b.hp = Math.max(0, b.hp - (b.isStar ? 2 : 5));
+      }
+      io.to(idA).emit('player:correct', { x: a.x, y: a.y, hp: a.hp, hit, otherName: b.name });
+      io.to(idB).emit('player:correct', { x: b.x, y: b.y, hp: b.hp, hit, otherName: a.name });
+    }
+  }
+}
 function createSystem(name, x, y, owner = null) {
   const id = 'world-' + nextSystemId++;
   const system = { id, name: cleanName(name || ('Unclaimed System ' + nextSystemId)), x: finiteBound(x, 120000), y: finiteBound(y, 120000), r: 18 + (nextSystemId % 25), color: owner ? '#ffbd66' : '#8fcfff', owner, baselineName: cleanName(name || 'Unclaimed System'), baselineX: finiteBound(x, 120000), baselineY: finiteBound(y, 120000), baselineR: 18 + (nextSystemId % 25) };
@@ -62,9 +97,15 @@ io.on('connection', socket => {
   let lastMove = 0;
   socket.on('join', data => {
     const old = players.get(socket.id) || {};
-    const spawnAngle = Math.random() * Math.PI * 2;
-    const spawnRadius = 45 + Math.random() * 90;
-    const spawn = { x: Math.cos(spawnAngle) * spawnRadius, y: Math.sin(spawnAngle) * spawnRadius };
+    let spawn = { x: 0, y: 0 };
+    // Pick a clear starting point so newly joined players do not stack together.
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 700 + Math.random() * 1800;
+      const candidate = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+      const clear = [...players.values()].every(other => Math.hypot(candidate.x - other.x, candidate.y - other.y) > other.r + 120);
+      if (clear) { spawn = candidate; break; }
+    }
     players.set(socket.id, { name: cleanName(data && data.name || old.name), x: spawn.x, y: spawn.y, r: Math.max(7, Math.min(100, Number(data && data.r) || 12)), level: Math.max(1, Math.min(200, Number(data && data.level) || 1)), isStar: !!(data && data.isStar), hp: Math.max(0, Math.min(100000, Number(data && data.hp) || 100)), maxHp: Math.max(1, Math.min(100000, Number(data && data.maxHp) || 100)) });
     socket.emit('player:spawn', spawn);
     if (!playerSystems.has(socket.id)) {
@@ -87,6 +128,7 @@ io.on('connection', socket => {
     const x = Number(data.x), y = Number(data.y), r = Number(data.r), level = Number(data.level);
     if (Number.isFinite(x) && Number.isFinite(y)) { p.x = finiteBound(x, 145000); p.y = finiteBound(y, 145000); }
     p.name = cleanName(data.name || p.name); p.r = Number.isFinite(r) ? Math.max(7, Math.min(100, r)) : 12; p.level = Number.isFinite(level) ? Math.max(1, Math.min(200, level)) : 1; p.isStar = !!data.isStar; p.hp = Number.isFinite(Number(data.hp)) ? Math.max(0, Math.min(100000, Number(data.hp))) : (p.hp || 100); p.maxHp = Number.isFinite(Number(data.maxHp)) ? Math.max(1, Math.min(100000, Number(data.maxHp))) : (p.maxHp || 100);
+    resolvePlayerCollisions();
     io.emit('players', publicPlayers());
   });
   socket.on('player:system:claim', data => {
@@ -101,6 +143,7 @@ io.on('connection', socket => {
   });
   socket.on('disconnect', () => {
     players.delete(socket.id);
+    for (const key of collisionCooldowns.keys()) if (key.includes(socket.id)) collisionCooldowns.delete(key);
     resetPlayerSystem(socket.id);
     io.emit('player:left', socket.id);
     broadcastPlayers();
